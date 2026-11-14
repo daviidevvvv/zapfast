@@ -790,6 +790,114 @@ fn sections(app: &App) -> Vec<Section> {
         },
     );
 
+    let mut stt_section = Section::new(translated(locale, "Trascrizione vocale"));
+    stt_section.row(
+        translated(locale, "Provider"),
+        translated(
+            locale,
+            "Motore principale per trascrivere i messaggi vocali (con fallback automatico).",
+        ),
+        move |ui, app| {
+            let palette = app.palette;
+            let selected = crate::stt::SttProvider::from_str_lossy(&app.settings.stt_provider);
+            let response = egui::ComboBox::from_id_salt("stt_provider")
+                .selected_text(selected.label())
+                .width(220.0_f32.min(ui.available_width()))
+                .show_ui(ui, |ui| {
+                    for provider in crate::stt::SttProvider::ALL {
+                        if theme_option(ui, &palette, provider.label(), provider == selected) {
+                            app.settings.stt_provider = provider.as_str().to_owned();
+                            app.actions.push(Action::SettingsChanged);
+                        }
+                    }
+                });
+            theme::reveal_focus(&response.response);
+        },
+    );
+    stt_section.block(
+        vec![
+            translated(locale, "Chiave API Groq"),
+            translated(locale, "Chiave API Google Gemini"),
+            translated(locale, "Trascrizione vocale"),
+            translated(locale, "Svuota cache"),
+        ],
+        move |ui, app| {
+            let palette = app.palette;
+            crate::stt::ui_settings_keys_block(
+                ui,
+                &mut app.stt,
+                &mut app.settings,
+                &palette,
+                &mut app.actions,
+            );
+        },
+    );
+    stt_section.row(
+        translated(locale, "Lingua"),
+        translated(
+            locale,
+            "Lingua attesa nei vocali oppure rilevamento automatico.",
+        ),
+        move |ui, app| {
+            const LANGUAGES: &[(&str, &str)] = &[
+                ("it", "Italiano (it)"),
+                ("auto", "Automatica (auto)"),
+                ("en", "Inglese (en)"),
+                ("es", "Spagnolo (es)"),
+                ("fr", "Francese (fr)"),
+                ("de", "Tedesco (de)"),
+                ("pt", "Portoghese (pt)"),
+            ];
+            let palette = app.palette;
+            let current = app.settings.stt_language.clone();
+            let current_label = LANGUAGES
+                .iter()
+                .find(|(code, _)| *code == current.as_str())
+                .map_or(current.as_str(), |(_, label)| *label);
+            let response = egui::ComboBox::from_id_salt("stt_language")
+                .selected_text(current_label)
+                .width(200.0_f32.min(ui.available_width()))
+                .show_ui(ui, |ui| {
+                    for &(code, label) in LANGUAGES {
+                        if theme_option(ui, &palette, label, current == code) {
+                            app.settings.stt_language = code.to_owned();
+                            app.actions.push(Action::SettingsChanged);
+                        }
+                    }
+                });
+            theme::reveal_focus(&response.response);
+        },
+    );
+    stt_section.row(
+        translated(locale, "Modello Groq"),
+        translated(
+            locale,
+            "Modello Whisper su Groq (predefinito: whisper-large-v3-turbo).",
+        ),
+        move |ui, app| {
+            let mut model = app.settings.stt_model.clone();
+            let response = ui.add(
+                egui::TextEdit::singleline(&mut model)
+                    .id(egui::Id::new("stt-groq-model"))
+                    .hint_text(crate::stt::DEFAULT_GROQ_MODEL)
+                    .desired_width(210.0_f32.min(ui.available_width())),
+            );
+            theme::reveal_focus(&response);
+            if response.changed() {
+                app.settings.stt_model = model;
+                app.actions.push(Action::SettingsChanged);
+            }
+        },
+    );
+    stt_section.toggle(
+        translated(locale, "Log dettagliati"),
+        translated(
+            locale,
+            "Registra informazioni diagnostiche di trascrizione nei log (senza chiavi API).",
+        ),
+        |settings| &mut settings.stt_debug,
+    );
+
     let mut account_section = Section::new(translated(locale, "Account"));
     account_section.block(
         vec![
@@ -909,6 +1017,7 @@ fn sections(app: &App) -> Vec<Section> {
         chats,
         notifications,
         privacy,
+        stt_section,
         system,
         account_section,
         files,

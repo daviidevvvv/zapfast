@@ -689,6 +689,8 @@ pub struct App {
     /// album reaches messages the transcript has not paged in, so their
     /// progress and their failure have nowhere else to live.
     pub viewer_media_state: HashMap<String, MediaState>,
+    /// Speech-to-text engine and persistent cache for voice messages.
+    pub stt: crate::stt::SttEngine,
     /// Message bodies registered for transcript copy formatting.
     pub copy_rows: std::sync::Arc<std::sync::Mutex<Vec<crate::transcript::Row>>>,
     /// Previous message-list rect used by the selection hook.
@@ -1556,6 +1558,8 @@ impl App {
         // With a password set, ZapFast starts locked.
         let app_lock = crate::app_lock::AppLock::new(settings.app_lock_hash.is_some());
         let tray_lockable = settings.app_lock_hash.is_some();
+        let stt_cache = dirs.state.join("stt_cache.json");
+        let stt = crate::stt::SttEngine::new(stt_cache, waker.clone());
         let mut app = Self {
             dirs,
             settings,
@@ -1674,6 +1678,7 @@ impl App {
             viewer_media: Vec::new(),
             viewer_media_chat: None,
             viewer_media_state: HashMap::new(),
+            stt,
             copy_rows: Default::default(),
             selection_view: Default::default(),
             gif_query: String::new(),
@@ -3687,6 +3692,7 @@ impl App {
         for index in removed.into_iter().rev() {
             self.finish_removed(index);
         }
+        self.stt.poll();
     }
 
     fn apply_backend_event(&mut self, event: Event, live: bool) {
@@ -5985,6 +5991,18 @@ impl App {
         // Playback waits belong to the account on screen.
         let want_video = want_video && !self.events_hidden;
         let want_voice = want_voice && !self.events_hidden;
+        if !self.events_hidden && card.is_none() && self.stt.has_waiting_download(chat, id) {
+            let mime = self
+                .conversations
+                .get(chat)
+                .and_then(|conversation| conversation.message(id))
+                .and_then(|message| message.content.media())
+                .map(|media| media.mime.clone())
+                .unwrap_or_else(|| "audio/ogg".to_owned());
+            let stt_result = result.as_ref().map_err(|err| download_notice(err.clone()));
+            self.stt
+                .finish_waiting_download(chat, id, &mime, stt_result);
+        }
         let applied = {
             let Some(message) = self
                 .conversations
@@ -10091,6 +10109,107 @@ impl App {
                     account.settings.notifications = on;
                     account.mark_settings_dirty();
                 }
+            }
+            Action::TranscribeVoice {
+                chat,
+                message,
+                force,
+            } => {
+                let media_info = self
+                    .conversations
+                    .get(&chat)
+                    .and_then(|conversation| conversation.message(&message))
+                    .and_then(|msg| msg.content.media())
+                    .map(|media| (media.path.clone(), media.mime.clone()));
+                if let Some((path, mime)) = media_info {
+                    let config = crate::stt::SttConfig::from_settings(&self.settings);
+                    let needs_download = self.stt.start_single(
+                        &chat,
+                        &message,
+                        path.as_deref(),
+                        &mime,
+                        config,
+                        force,
+                    );
+                    if needs_download {
+                        self.actions.push(Action::Download {
+                            manual: true,
+                            card: None,
+                            chat,
+                            message,
+                        });
+                    }
+                }
+            }
+            Action::TranscribeAllVoices(chat) => {
+                let items: Vec<(String, Option<PathBuf>, String)> = self
+                    .conversations
+                    .get(&chat)
+                    .map(|conversation| {
+                        conversation
+                            .messages
+                            .iter()
+                            .filter_map(|msg| match &msg.content {
+                                Content::Audio { media, .. } => {
+                                    Some((msg.id.clone(), media.path.clone(), media.mime.clone()))
+                                }
+                                _ => None,
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                let config = crate::stt::SttConfig::from_settings(&self.settings);
+                let need_downloads = self.stt.start_bulk(&chat, items, config);
+                for message_id in need_downloads {
+                    self.actions.push(Action::Download {
+                        manual: true,
+                        card: None,
+                        chat: chat.clone(),
+                        message: message_id,
+                    });
+                }
+            }
+            Action::StopBulkTranscribe => {
+                self.stt.stop_bulk();
+            }
+            Action::CopySttTranscript {
+                chat,
+                message,
+                text,
+            } => {
+                ctx.copy_text(text);
+                self.stt.mark_copied(&chat, &message);
+            }
+            Action::TestSttKey(kind) => {
+                let key = match kind {
+                    crate::stt::KeyKind::Groq => self.settings.stt_groq_api_key.clone(),
+                    crate::stt::KeyKind::Google => self.settings.stt_google_api_key.clone(),
+                };
+                let config = crate::stt::SttConfig::from_settings(&self.settings);
+                self.stt.test_key(kind, key, config);
+            }
+            Action::ClearSttKey(kind) => {
+                match kind {
+                    crate::stt::KeyKind::Groq => {
+                        self.settings.stt_groq_api_key.clear();
+                        self.stt.settings_draft.groq = Some(String::new());
+                        self.stt.groq_test = crate::stt::KeyTestState::Idle;
+                    }
+                    crate::stt::KeyKind::Google => {
+                        self.settings.stt_google_api_key.clear();
+                        self.stt.settings_draft.google = Some(String::new());
+                        self.stt.google_test = crate::stt::KeyTestState::Idle;
+                    }
+                }
+                self.mark_settings_dirty();
+            }
+            Action::ClearSttCache => {
+                self.stt.clear_cache();
+            }
+            Action::OpenSttSettings => {
+                self.page = Page::Settings;
+                self.settings_search = "Trascrizione vocale".to_owned();
+                self.focus_settings_search = false;
             }
         }
     }

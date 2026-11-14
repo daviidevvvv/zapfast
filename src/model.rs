@@ -3457,6 +3457,30 @@ pub enum Action {
     CancelPictureEdit,
     /// Removes all pending attachments.
     ClearPending,
+    /// Transcribes a voice message (or retries if `force` is true).
+    TranscribeVoice {
+        chat: ChatId,
+        message: String,
+        force: bool,
+    },
+    /// Transcribes all un-transcribed voice messages in a chat.
+    TranscribeAllVoices(ChatId),
+    /// Cancels any active bulk voice transcription queue.
+    StopBulkTranscribe,
+    /// Copies a voice transcription to the clipboard and shows feedback.
+    CopySttTranscript {
+        chat: ChatId,
+        message: String,
+        text: String,
+    },
+    /// Tests the saved Groq or Google Gemini API key.
+    TestSttKey(crate::stt::KeyKind),
+    /// Clears a saved STT API key.
+    ClearSttKey(crate::stt::KeyKind),
+    /// Deletes cached voice transcripts.
+    ClearSttCache,
+    /// Opens Settings filtered to voice transcription.
+    OpenSttSettings,
 }
 
 #[cfg(test)]

@@ -494,7 +494,22 @@ fn header(app: &mut App, ui: &mut egui::Ui, chat: &Chat) -> Rect {
                 } else {
                     (buttons, call_buttons)
                 };
-                let right_controls = controls_width(buttons, palette.vibrant()) + extra;
+                let has_audio = app
+                    .conversations
+                    .get(&chat.id)
+                    .is_some_and(|conv| crate::stt::count_audio_messages(&conv.messages) > 0);
+                let stt_width = crate::stt::ui_header_width(ui, &app.stt, &chat.id, has_audio);
+                let show_stt_inline = !folded
+                    && has_audio
+                    && header_fits(
+                        ui.available_width(),
+                        buttons,
+                        extra + stt_width,
+                        palette.vibrant(),
+                    );
+                let right_controls = controls_width(buttons, palette.vibrant())
+                    + extra
+                    + if show_stt_inline { stt_width } else { 0.0 };
                 // On a vibrant window the name and the buttons sit on glass
                 // pills, drawn beneath them once they are measured.
                 let name_pill = ui.painter().add(egui::Shape::Noop);
@@ -704,6 +719,7 @@ fn header(app: &mut App, ui: &mut egui::Ui, chat: &Chat) -> Rect {
                             copy_number_label.as_ref(),
                             close_label.as_ref(),
                             &super::blocking::label(app, &chat.id),
+                            "Impostazioni trascrizione vocale",
                         ],
                         true,
                     );
@@ -834,6 +850,36 @@ fn header(app: &mut App, ui: &mut egui::Ui, chat: &Chat) -> Rect {
                             {
                                 app.actions.push(Action::CopyText(format!("+{phone}")));
                             }
+                            if has_audio {
+                                let bulk = app.stt.bulk();
+                                let bulk_here = bulk.active && bulk.chat_id == chat.id;
+                                let bulk_label = if bulk_here {
+                                    format!("Stop ({}/{})", bulk.done, bulk.total)
+                                } else {
+                                    "Trascrivi tutti i vocali".to_owned()
+                                };
+                                if widgets::menu_item(
+                                    ui,
+                                    &palette,
+                                    Some(if bulk_here { Icon::X } else { Icon::Mic }),
+                                    &bulk_label,
+                                ) {
+                                    app.actions.push(if bulk_here {
+                                        Action::StopBulkTranscribe
+                                    } else {
+                                        Action::TranscribeAllVoices(chat.id.clone())
+                                    });
+                                }
+                                if widgets::menu_item(
+                                    ui,
+                                    &palette,
+                                    Some(Icon::Settings),
+                                    "Impostazioni trascrizione vocale",
+                                ) {
+                                    app.actions.push(Action::OpenSttSettings);
+                                }
+                                widgets::menu_separator(ui, &palette);
+                            }
                             if widgets::menu_item(ui, &palette, Some(Icon::X), close_label.as_ref())
                             {
                                 app.actions.push(Action::CloseChat);
@@ -938,6 +984,16 @@ fn header(app: &mut App, ui: &mut egui::Ui, chat: &Chat) -> Rect {
                                 Action::OpenChatSearch
                             });
                         }
+                    }
+                    if show_stt_inline {
+                        crate::stt::ui_header_controls(
+                            ui,
+                            &app.stt,
+                            &chat.id,
+                            true,
+                            &palette,
+                            &mut app.actions,
+                        );
                     }
                     // A narrow window shows the list or the chat, not both;
                     // this is the way back to the list.
@@ -2675,6 +2731,7 @@ struct View<'a> {
     /// The speed this chat's voice messages play at.
     voice_speed: f32,
     video: &'a crate::video::Player,
+    stt: &'a crate::stt::SttEngine,
     copy_rows: Option<&'a std::sync::Mutex<Vec<crate::transcript::Row>>>,
     /// How far this chat's downloading attachments have got, by message.
     download_progress: Option<&'a HashMap<String, u8>>,
@@ -3137,6 +3194,7 @@ fn messages(app: &mut App, ui: &mut egui::Ui, chat: &Chat, under: f32) {
         player: &app.player,
         voice_speed: app.voice_speed_in(Some(&chat.id)),
         video: &app.video,
+        stt: &app.stt,
         // Whole-message exports are already formatted. Do not let the
         // text-selection annotator reinterpret them as drawn body text.
         copy_rows: (!app.selection.as_ref().is_some_and(|(id, _)| *id == chat.id))
@@ -5711,6 +5769,17 @@ fn bubble_frame(
             {
                 interactive_buttons(ui, view, message, card, settled.unwrap_or(cap), actions);
             }
+            if matches!(&message.content, Content::Audio { .. }) {
+                crate::stt::ui_voice_bubble(
+                    ui,
+                    view.stt,
+                    &palette,
+                    &view.chat.id,
+                    message,
+                    settled.unwrap_or(cap),
+                    actions,
+                );
+            }
             if let Some((reserved, galley)) = forwarded {
                 let at = pos2(ui.min_rect().left(), reserved.top());
                 let painted = paint_forwarded_label(ui, &palette, at, galley);
@@ -7118,6 +7187,7 @@ pub(crate) fn list_menu(
         voice_speed: app.voice_speed_in(Some(&chat.id)),
         video: &app.video,
         account_receipts_off: app.account_receipts_off,
+        stt: &app.stt,
         copy_rows: Some(app.copy_rows.as_ref()),
         download_progress: app.download_progress.get(&chat.id),
         selecting: false,
@@ -7639,6 +7709,9 @@ fn context_menu(
         && media.path.is_some()
     {
         speed_menu_row(ui, view, message, actions);
+    }
+    if matches!(&message.content, Content::Audio { .. }) {
+        crate::stt::ui_voice_context_menu(ui, view.stt, &palette, &view.chat.id, message, actions);
     }
     widgets::menu_separator(ui, &palette);
     // The menu holds actions only. Sent, delivery, and read times, per member
@@ -12838,6 +12911,7 @@ mod tests {
             voice_speed: app.settings.voice_speed,
             video: &app.video,
             account_receipts_off: false,
+            stt: &app.stt,
             copy_rows: Some(app.copy_rows.as_ref()),
             download_progress: None,
             selecting: false,

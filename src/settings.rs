@@ -548,6 +548,18 @@ pub struct Settings {
     pub window_y: Option<f32>,
     /// Whether the window was maximized when it last closed.
     pub window_maximized: bool,
+    /// Groq API key for speech-to-text transcription.
+    pub stt_groq_api_key: String,
+    /// Google Gemini API key for speech-to-text transcription fallback.
+    pub stt_google_api_key: String,
+    /// Preferred speech-to-text provider (`auto`, `groq`, `google`).
+    pub stt_provider: String,
+    /// Preferred transcription language code (`it`, `auto`, `en`, `es`).
+    pub stt_language: String,
+    /// Groq Whisper model identifier.
+    pub stt_model: String,
+    /// Whether verbose speech-to-text logging is enabled.
+    pub stt_debug: bool,
 }
 
 impl Default for Settings {
@@ -605,6 +617,12 @@ impl Default for Settings {
             window_x: None,
             window_y: None,
             window_maximized: false,
+            stt_groq_api_key: String::new(),
+            stt_google_api_key: String::new(),
+            stt_provider: crate::stt::SttProvider::Auto.as_str().to_owned(),
+            stt_language: crate::stt::DEFAULT_LANGUAGE.to_owned(),
+            stt_model: crate::stt::DEFAULT_GROQ_MODEL.to_owned(),
+            stt_debug: false,
         }
     }
 }
