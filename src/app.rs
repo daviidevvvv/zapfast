@@ -447,17 +447,13 @@ fn composer_link(text: &str) -> Option<String> {
     crate::safety::first_link(text).filter(|url| crate::safety::preview_url(url).is_some())
 }
 
-const WINDOWS_LINE_SCROLL_SPEED: f32 = 42.0;
+const WINDOWS_LINE_SCROLL_SPEED: f32 = 36.0;
 const DEFAULT_LINE_SCROLL_SPEED: f32 = 120.0;
-const WINDOWS_TOUCHPAD_FACTOR: f32 = 0.52;
-const TOUCHPAD_LATCH_SECS: f64 = 0.45;
 
-/// Tracks input-level scroll scaling across frames (for example, Windows
-/// Precision Touchpad gestures arriving as fractional line deltas).
+/// Calibrates raw mouse-wheel and Precision Touchpad scroll input across
+/// platforms before egui integrates deltas.
 #[derive(Debug, Default)]
-pub(crate) struct ScrollInputState {
-    last_fractional_wheel_at: Option<f64>,
-}
+pub(crate) struct ScrollInputState {}
 
 impl ScrollInputState {
     fn target_line_scroll_speed(scroll_speed: f32, is_windows: bool) -> f32 {
@@ -486,15 +482,15 @@ impl ScrollInputState {
     ) {
         Self::apply_line_scroll_speed(ctx, scroll_speed, is_windows);
 
-        let now = input.time.unwrap_or_else(|| ctx.input(|i| i.time));
         let zoom_modifier = ctx.options(|options| options.input_options.zoom_modifier);
 
+        let mut needs_windows_touch_start = false;
         for event in &mut input.events {
             let egui::Event::MouseWheel {
                 unit,
                 delta,
                 modifiers,
-                ..
+                phase,
             } = event
             else {
                 continue;
@@ -504,20 +500,8 @@ impl ScrollInputState {
             }
             match unit {
                 egui::MouseWheelUnit::Line => {
-                    if is_windows {
-                        let is_fractional =
-                            delta.x.fract().abs() > 1e-4 || delta.y.fract().abs() > 1e-4;
-                        if is_fractional {
-                            self.last_fractional_wheel_at = Some(now);
-                        }
-                        let is_touchpad = is_fractional
-                            || self.last_fractional_wheel_at.is_some_and(|prev| {
-                                let elapsed = now - prev;
-                                (0.0..=TOUCHPAD_LATCH_SECS).contains(&elapsed)
-                            });
-                        if is_touchpad {
-                            *delta *= WINDOWS_TOUCHPAD_FACTOR;
-                        }
+                    if is_windows && *phase == egui::TouchPhase::Move {
+                        needs_windows_touch_start = true;
                     }
                 }
                 egui::MouseWheelUnit::Point => {
@@ -525,6 +509,57 @@ impl ScrollInputState {
                 }
                 egui::MouseWheelUnit::Page => {}
             }
+        }
+
+        if needs_windows_touch_start {
+            // Windows reports both mouse wheels and Precision Touchpads as
+            // `Line` + `Move`, which sends every delta through egui's 100 ms
+            // `unprocessed_wheel_delta` smoothing queue and adds rubber-band
+            // lag on top of OS touchpad inertia. Prepending a zero-delta
+            // `Start` event enters `Status::InTouch` and resets latched
+            // modifiers (`Ctrl`/`Shift`), so the subsequent `Move` applies
+            // `line_scroll_speed` immediately and linearly while keeping
+            // `unit == Line`.
+            let mut rewritten = Vec::with_capacity(input.events.len() + 2);
+            let mut active_modifiers: Option<egui::Modifiers> = None;
+            for event in input.events.drain(..) {
+                if let egui::Event::MouseWheel {
+                    unit,
+                    modifiers,
+                    phase,
+                    ..
+                } = event
+                {
+                    if unit == egui::MouseWheelUnit::Line
+                        && phase == egui::TouchPhase::Move
+                        && !modifiers.matches_any(zoom_modifier)
+                    {
+                        if active_modifiers != Some(modifiers) {
+                            rewritten.push(egui::Event::MouseWheel {
+                                unit: egui::MouseWheelUnit::Line,
+                                delta: egui::Vec2::ZERO,
+                                modifiers,
+                                phase: egui::TouchPhase::Start,
+                            });
+                            active_modifiers = Some(modifiers);
+                        }
+                    } else {
+                        match phase {
+                            egui::TouchPhase::Start => active_modifiers = Some(modifiers),
+                            egui::TouchPhase::End | egui::TouchPhase::Cancel => {
+                                active_modifiers = None;
+                            }
+                            egui::TouchPhase::Move => {
+                                if let Some(prev) = active_modifiers.as_mut() {
+                                    *prev |= modifiers;
+                                }
+                            }
+                        }
+                    }
+                }
+                rewritten.push(event);
+            }
+            input.events = rewritten;
         }
     }
 }
@@ -15654,14 +15689,89 @@ mod tests {
     }
 
     #[test]
-    fn windows_fractional_wheel_calibrates_touchpad_without_touching_zoom() {
+    fn windows_wheel_is_linear_and_direct_without_touching_zoom() {
         let ctx = egui::Context::default();
         let mut state = ScrollInputState::default();
 
-        // Discrete integer mouse-wheel click does not trigger the touchpad
-        // factor, and uses the calmer Windows line_scroll_speed (42.0).
-        let mut mouse_input = egui::RawInput {
+        // Fractional Precision Touchpad delta prepends a `Start(0)` phase and
+        // retains the linear `Move` delta so egui bypasses the 100 ms
+        // `unprocessed_wheel_delta` spring queue while keeping `unit == Line`.
+        let mut pad_input = egui::RawInput {
             time: Some(1.0),
+            events: vec![egui::Event::MouseWheel {
+                unit: egui::MouseWheelUnit::Line,
+                delta: egui::vec2(0.0, -0.25),
+                modifiers: egui::Modifiers::NONE,
+                phase: egui::TouchPhase::Move,
+            }],
+            ..Default::default()
+        };
+        state.prepare_raw_input_for(&ctx, &mut pad_input, 1.0, true);
+        assert_eq!(
+            ctx.options(|o| o.input_options.line_scroll_speed),
+            WINDOWS_LINE_SCROLL_SPEED
+        );
+        assert_eq!(pad_input.events.len(), 2);
+        match pad_input.events[0] {
+            egui::Event::MouseWheel {
+                unit,
+                delta,
+                modifiers,
+                phase,
+            } => {
+                assert_eq!(unit, egui::MouseWheelUnit::Line);
+                assert_eq!(delta, egui::Vec2::ZERO);
+                assert_eq!(modifiers, egui::Modifiers::NONE);
+                assert_eq!(phase, egui::TouchPhase::Start);
+            }
+            _ => unreachable!(),
+        }
+        match pad_input.events[1] {
+            egui::Event::MouseWheel {
+                unit,
+                delta,
+                modifiers,
+                phase,
+            } => {
+                assert_eq!(unit, egui::MouseWheelUnit::Line);
+                assert_eq!(delta, egui::vec2(0.0, -0.25));
+                assert_eq!(modifiers, egui::Modifiers::NONE);
+                assert_eq!(phase, egui::TouchPhase::Move);
+            }
+            _ => unreachable!(),
+        }
+
+        let mut scrolled_first = 0.0;
+        ctx.run_ui(pad_input, |ui| {
+            scrolled_first = ui.ctx().input(|i| i.smooth_scroll_delta.y);
+        })
+        .textures_delta
+        .clear();
+        assert!(
+            (scrolled_first + 0.25 * WINDOWS_LINE_SCROLL_SPEED).abs() < 1e-3,
+            "expected direct frame scroll, got {scrolled_first}"
+        );
+
+        let mut scrolled_tail = 0.0;
+        ctx.run_ui(
+            egui::RawInput {
+                time: Some(1.016),
+                ..Default::default()
+            },
+            |ui| {
+                scrolled_tail = ui.ctx().input(|i| i.smooth_scroll_delta.y);
+            },
+        )
+        .textures_delta
+        .clear();
+        assert_eq!(
+            scrolled_tail, 0.0,
+            "direct Windows wheel must not leave a buffered spring tail"
+        );
+
+        // An exact integer tick scales uniformly with the fractional one (4x of -0.25).
+        let mut int_input = egui::RawInput {
+            time: Some(2.0),
             events: vec![egui::Event::MouseWheel {
                 unit: egui::MouseWheelUnit::Line,
                 delta: egui::vec2(0.0, -1.0),
@@ -15670,53 +15780,22 @@ mod tests {
             }],
             ..Default::default()
         };
-        state.prepare_raw_input_for(&ctx, &mut mouse_input, 1.0, true);
-        assert_eq!(
-            ctx.options(|o| o.input_options.line_scroll_speed),
-            WINDOWS_LINE_SCROLL_SPEED
+        state.prepare_raw_input_for(&ctx, &mut int_input, 1.0, true);
+        let mut scrolled_int = 0.0;
+        ctx.run_ui(int_input, |ui| {
+            scrolled_int = ui.ctx().input(|i| i.smooth_scroll_delta.y);
+        })
+        .textures_delta
+        .clear();
+        assert!(
+            (scrolled_int + WINDOWS_LINE_SCROLL_SPEED).abs() < 1e-3,
+            "integer tick must stay strictly proportional, got {scrolled_int}"
         );
-        match mouse_input.events[0] {
-            egui::Event::MouseWheel { delta, .. } => assert_eq!(delta, egui::vec2(0.0, -1.0)),
-            _ => unreachable!(),
-        }
 
-        // Precision Touchpad emits fractional line deltas: scales by 0.52 and
-        // latches so an exact integer follow-up event inside 0.45s also scales.
-        let mut pad_input = egui::RawInput {
-            time: Some(1.1),
-            events: vec![
-                egui::Event::MouseWheel {
-                    unit: egui::MouseWheelUnit::Line,
-                    delta: egui::vec2(0.0, -0.25),
-                    modifiers: egui::Modifiers::NONE,
-                    phase: egui::TouchPhase::Move,
-                },
-                egui::Event::MouseWheel {
-                    unit: egui::MouseWheelUnit::Line,
-                    delta: egui::vec2(0.0, -1.0),
-                    modifiers: egui::Modifiers::NONE,
-                    phase: egui::TouchPhase::Move,
-                },
-            ],
-            ..Default::default()
-        };
-        state.prepare_raw_input_for(&ctx, &mut pad_input, 1.0, true);
-        match pad_input.events[0] {
-            egui::Event::MouseWheel { delta, .. } => {
-                assert!((delta.y + 0.25 * WINDOWS_TOUCHPAD_FACTOR).abs() < 1e-6);
-            }
-            _ => unreachable!(),
-        }
-        match pad_input.events[1] {
-            egui::Event::MouseWheel { delta, .. } => {
-                assert!((delta.y + WINDOWS_TOUCHPAD_FACTOR).abs() < 1e-6);
-            }
-            _ => unreachable!(),
-        }
-
-        // Ctrl+Wheel / touchpad pinch-to-zoom must remain untouched.
+        // Ctrl+Wheel / touchpad pinch-to-zoom must remain untouched and must not
+        // latch `Ctrl` onto a subsequent normal scroll.
         let mut zoom_input = egui::RawInput {
-            time: Some(1.15),
+            time: Some(2.05),
             events: vec![egui::Event::MouseWheel {
                 unit: egui::MouseWheelUnit::Line,
                 delta: egui::vec2(0.0, 0.2),
@@ -15726,25 +15805,87 @@ mod tests {
             ..Default::default()
         };
         state.prepare_raw_input_for(&ctx, &mut zoom_input, 0.5, true);
+        assert_eq!(zoom_input.events.len(), 1);
         match zoom_input.events[0] {
-            egui::Event::MouseWheel { delta, .. } => assert_eq!(delta, egui::vec2(0.0, 0.2)),
+            egui::Event::MouseWheel { delta, phase, .. } => {
+                assert_eq!(delta, egui::vec2(0.0, 0.2));
+                assert_eq!(phase, egui::TouchPhase::Move);
+            }
             _ => unreachable!(),
         }
+        let mut zoom_after_ctrl = 1.0;
+        ctx.run_ui(zoom_input, |ui| {
+            zoom_after_ctrl = ui.ctx().input(|i| i.zoom_delta());
+        })
+        .textures_delta
+        .clear();
+        assert!(
+            (zoom_after_ctrl - 1.0).abs() > 1e-3,
+            "expected Ctrl+wheel to trigger zoom, got {zoom_after_ctrl}"
+        );
 
-        // Once the latch expires, pure integer notches go back to unscaled 1.0.
-        let mut later_mouse = egui::RawInput {
-            time: Some(2.0),
+        let mut post_zoom_scroll = egui::RawInput {
+            time: Some(2.07),
             events: vec![egui::Event::MouseWheel {
                 unit: egui::MouseWheelUnit::Line,
-                delta: egui::vec2(0.0, 1.0),
+                delta: egui::vec2(0.0, -0.5),
                 modifiers: egui::Modifiers::NONE,
                 phase: egui::TouchPhase::Move,
             }],
             ..Default::default()
         };
-        state.prepare_raw_input_for(&ctx, &mut later_mouse, 1.0, true);
-        match later_mouse.events[0] {
-            egui::Event::MouseWheel { delta, .. } => assert_eq!(delta, egui::vec2(0.0, 1.0)),
+        state.prepare_raw_input_for(&ctx, &mut post_zoom_scroll, 1.0, true);
+        let mut post_zoom_delta = 1.0;
+        let mut post_zoom_scroll_y = 0.0;
+        ctx.run_ui(post_zoom_scroll, |ui| {
+            ui.ctx().input(|i| {
+                post_zoom_delta = i.zoom_delta();
+                post_zoom_scroll_y = i.smooth_scroll_delta.y;
+            });
+        })
+        .textures_delta
+        .clear();
+        assert_eq!(
+            post_zoom_delta, 1.0,
+            "Ctrl modifier must not stick after zoom ends"
+        );
+        assert!(
+            (post_zoom_scroll_y + 0.5 * WINDOWS_LINE_SCROLL_SPEED).abs() < 1e-3,
+            "expected normal scroll after zoom, got {post_zoom_scroll_y}"
+        );
+
+        // Non-Windows platforms preserve default line_scroll_speed, Move phase,
+        // and Point speed scaling.
+        let mut point_input = egui::RawInput {
+            time: Some(2.1),
+            events: vec![
+                egui::Event::MouseWheel {
+                    unit: egui::MouseWheelUnit::Line,
+                    delta: egui::vec2(0.0, -1.0),
+                    modifiers: egui::Modifiers::NONE,
+                    phase: egui::TouchPhase::Move,
+                },
+                egui::Event::MouseWheel {
+                    unit: egui::MouseWheelUnit::Point,
+                    delta: egui::vec2(0.0, -10.0),
+                    modifiers: egui::Modifiers::NONE,
+                    phase: egui::TouchPhase::Move,
+                },
+            ],
+            ..Default::default()
+        };
+        state.prepare_raw_input_for(&ctx, &mut point_input, 0.5, false);
+        assert_eq!(point_input.events.len(), 2);
+        assert_eq!(
+            ctx.options(|o| o.input_options.line_scroll_speed),
+            DEFAULT_LINE_SCROLL_SPEED * 0.5
+        );
+        match point_input.events[0] {
+            egui::Event::MouseWheel { phase, .. } => assert_eq!(phase, egui::TouchPhase::Move),
+            _ => unreachable!(),
+        }
+        match point_input.events[1] {
+            egui::Event::MouseWheel { delta, .. } => assert_eq!(delta, egui::vec2(0.0, -5.0)),
             _ => unreachable!(),
         }
     }
