@@ -27,11 +27,10 @@ const GEMINI_BASE_URL: &str = "https://generativelanguage.googleapis.com/v1beta/
 pub const DEFAULT_GROQ_MODEL: &str = "whisper-large-v3-turbo";
 pub const DEFAULT_LANGUAGE: &str = "it";
 pub const GOOGLE_MODELS: &[&str] = &[
-    "gemini-3.5-flash",
+    "gemini-3.5-transcribe",
     "gemini-3.5-flash-lite",
-    "gemini-2.5-flash",
-    "gemini-2.5-flash-lite",
-    "gemini-2.0-flash",
+    "gemini-3.1-flash-lite",
+    "gemini-4-hydrogen",
 ];
 
 const MAX_GROQ_UPLOAD_BYTES: usize = 25 * 1024 * 1024;
@@ -1007,26 +1006,9 @@ fn transcribe_google(
     }
 
     let encoded_audio = BASE64_STANDARD.encode(bytes);
-    let prompt = build_google_prompt(&config.language);
-    let request_json = GeminiRequest {
-        contents: vec![GeminiContent {
-            parts: vec![
-                GeminiPart::Text { text: prompt },
-                GeminiPart::InlineData {
-                    inline_data: GeminiInlineData {
-                        mime_type: mime.to_owned(),
-                        data: encoded_audio,
-                    },
-                },
-            ],
-        }],
-        generation_config: GeminiGenerationConfig { temperature: 0.0 },
-    };
-    let payload = serde_json::to_vec(&request_json)
-        .map_err(|err| ApiError::fatal(format!("Serializzazione JSON Gemini fallita: {err}")))?;
-
     let mut last_err = ApiError::fatal("Nessun modello Google Gemini disponibile.");
     for &model in GOOGLE_MODELS {
+        let payload = build_google_payload(model, mime, &encoded_audio, &config.language)?;
         let url = format!("{GEMINI_BASE_URL}/{model}:generateContent");
         for attempt in 0..GEMINI_ATTEMPTS_PER_MODEL {
             let response = client
@@ -1070,7 +1052,7 @@ fn transcribe_google(
                         });
                     }
 
-                    let model_unavailable = code == 404;
+                    let model_unavailable = matches!(code, 400 | 404);
                     let retryable = code == 429 || code >= 500;
                     last_err = ApiError {
                         message: format!("Google ({model}) HTTP {code}: {detail}"),
@@ -1179,7 +1161,8 @@ struct GroqResponse {
 #[serde(rename_all = "camelCase")]
 struct GeminiRequest {
     contents: Vec<GeminiContent>,
-    generation_config: GeminiGenerationConfig,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    generation_config: Option<GeminiGenerationConfig>,
 }
 
 #[derive(Serialize)]
@@ -1190,19 +1173,93 @@ struct GeminiContent {
 #[derive(Serialize)]
 #[serde(untagged)]
 enum GeminiPart {
-    Text { text: String },
-    InlineData { inline_data: GeminiInlineData },
+    Text {
+        text: String,
+    },
+    InlineData {
+        #[serde(rename = "inlineData")]
+        inline_data: GeminiInlineData,
+    },
 }
 
 #[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
 struct GeminiInlineData {
     mime_type: String,
     data: String,
 }
 
 #[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
 struct GeminiGenerationConfig {
-    temperature: f32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    temperature: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    audio_transcription_config: Option<GeminiAudioTranscriptionConfig>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct GeminiAudioTranscriptionConfig {
+    mode: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    language_codes: Option<Vec<&'static str>>,
+}
+
+fn google_bcp47_language(language: &str) -> Option<&'static str> {
+    match language.trim().to_ascii_lowercase().as_str() {
+        "it" => Some("it-IT"),
+        "en" => Some("en-US"),
+        "es" => Some("es-ES"),
+        "fr" => Some("fr-FR"),
+        "de" => Some("de-DE"),
+        "pt" => Some("pt-PT"),
+        _ => None,
+    }
+}
+
+fn build_google_payload(
+    model: &str,
+    mime: &str,
+    encoded_audio: &str,
+    language: &str,
+) -> Result<Vec<u8>, ApiError> {
+    let inline = GeminiPart::InlineData {
+        inline_data: GeminiInlineData {
+            mime_type: mime.to_owned(),
+            data: encoded_audio.to_owned(),
+        },
+    };
+    let request_json = if model == "gemini-3.5-transcribe" {
+        // Dedicated STT model: send raw audio + audioTranscriptionConfig without prompt text.
+        GeminiRequest {
+            contents: vec![GeminiContent {
+                parts: vec![inline],
+            }],
+            generation_config: Some(GeminiGenerationConfig {
+                temperature: None,
+                audio_transcription_config: Some(GeminiAudioTranscriptionConfig {
+                    mode: "SMART",
+                    language_codes: google_bcp47_language(language).map(|code| vec![code]),
+                }),
+            }),
+        }
+    } else {
+        let prompt = build_google_prompt(language);
+        let generation_config =
+            (!model.starts_with("gemini-4-")).then_some(GeminiGenerationConfig {
+                temperature: Some(0.0),
+                audio_transcription_config: None,
+            });
+        GeminiRequest {
+            contents: vec![GeminiContent {
+                parts: vec![GeminiPart::Text { text: prompt }, inline],
+            }],
+            generation_config,
+        }
+    };
+    serde_json::to_vec(&request_json)
+        .map_err(|err| ApiError::fatal(format!("Serializzazione JSON Gemini fallita: {err}")))
 }
 
 fn build_google_prompt(language: &str) -> String {
@@ -1968,6 +2025,59 @@ mod tests {
         prune_entries(&mut entries, 1, CACHE_MAX_AGE_SECS, now);
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].0, "newest");
+    }
+
+    #[test]
+    fn google_models_priority_order_and_payloads() {
+        assert_eq!(
+            GOOGLE_MODELS,
+            &[
+                "gemini-3.5-transcribe",
+                "gemini-3.5-flash-lite",
+                "gemini-3.1-flash-lite",
+                "gemini-4-hydrogen",
+            ]
+        );
+
+        let transcribe_json: serde_json::Value = serde_json::from_slice(
+            &build_google_payload("gemini-3.5-transcribe", "audio/ogg", "AQID", "it").unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            transcribe_json["contents"][0]["parts"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            transcribe_json["contents"][0]["parts"][0]["inlineData"]["mimeType"],
+            "audio/ogg"
+        );
+        assert_eq!(
+            transcribe_json["generationConfig"]["audioTranscriptionConfig"]["mode"],
+            "SMART"
+        );
+        assert_eq!(
+            transcribe_json["generationConfig"]["audioTranscriptionConfig"]["languageCodes"][0],
+            "it-IT"
+        );
+
+        let lite_json: serde_json::Value = serde_json::from_slice(
+            &build_google_payload("gemini-3.5-flash-lite", "audio/ogg", "AQID", "auto").unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            lite_json["contents"][0]["parts"].as_array().unwrap().len(),
+            2
+        );
+        assert_eq!(lite_json["generationConfig"]["temperature"], 0.0);
+
+        let hydrogen_json: serde_json::Value = serde_json::from_slice(
+            &build_google_payload("gemini-4-hydrogen", "audio/ogg", "AQID", "it").unwrap(),
+        )
+        .unwrap();
+        assert!(hydrogen_json.get("generationConfig").is_none());
     }
 
     #[test]
