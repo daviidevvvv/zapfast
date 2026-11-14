@@ -558,6 +558,8 @@ pub struct Settings {
     pub stt_language: String,
     /// Groq Whisper model identifier.
     pub stt_model: String,
+    /// Preferred primary Google Gemini STT model (`auto` uses the ordered fallback ladder).
+    pub stt_google_model: String,
     /// Whether verbose speech-to-text logging is enabled.
     pub stt_debug: bool,
 }
@@ -622,6 +624,7 @@ impl Default for Settings {
             stt_provider: crate::stt::SttProvider::Auto.as_str().to_owned(),
             stt_language: crate::stt::DEFAULT_LANGUAGE.to_owned(),
             stt_model: crate::stt::DEFAULT_GROQ_MODEL.to_owned(),
+            stt_google_model: crate::stt::AUTO_GOOGLE_MODEL.to_owned(),
             stt_debug: false,
         }
     }
@@ -1099,6 +1102,7 @@ mod tests {
         let parsed: Settings =
             serde_json::from_str(r#"{"theme":"light","future_field":1}"#).expect("parses");
         assert_eq!(parsed.theme, ThemeChoice::Light);
+        assert_eq!(parsed.stt_google_model, crate::stt::AUTO_GOOGLE_MODEL);
         assert!(parsed.enter_sends);
         assert!(parsed.check_for_updates);
         assert!(!parsed.download_updates_automatically);

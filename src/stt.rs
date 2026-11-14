@@ -26,6 +26,9 @@ const GEMINI_BASE_URL: &str = "https://generativelanguage.googleapis.com/v1beta/
 
 pub const DEFAULT_GROQ_MODEL: &str = "whisper-large-v3-turbo";
 pub const DEFAULT_LANGUAGE: &str = "it";
+pub const AUTO_GOOGLE_MODEL: &str = "auto";
+pub const NO_SPEECH_TEXT: &str = "(Nessun parlato rilevato)";
+
 pub const GOOGLE_MODELS: &[&str] = &[
     "gemini-3.5-transcribe",
     "gemini-3.5-flash-lite",
@@ -129,6 +132,7 @@ pub struct SttConfig {
     pub provider: SttProvider,
     pub language: String,
     pub model: String,
+    pub google_model: String,
     pub debug: bool,
     pub proxy: Option<reqwest::Proxy>,
 }
@@ -136,6 +140,7 @@ pub struct SttConfig {
 impl SttConfig {
     pub fn from_settings(settings: &Settings) -> Self {
         let model = settings.stt_model.trim();
+        let google_model = normalize_google_model(&settings.stt_google_model);
         let language = settings.stt_language.trim();
         Self {
             groq_api_key: settings.stt_groq_api_key.trim().to_owned(),
@@ -151,10 +156,51 @@ impl SttConfig {
             } else {
                 model.to_owned()
             },
+            google_model,
             debug: settings.stt_debug,
             proxy: crate::proxy::reqwest_proxy(),
         }
     }
+}
+
+pub fn normalize_google_model(raw: &str) -> String {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() || trimmed.eq_ignore_ascii_case(AUTO_GOOGLE_MODEL) {
+        AUTO_GOOGLE_MODEL.to_owned()
+    } else {
+        trimmed.to_owned()
+    }
+}
+
+/// Returns the ordered list of Google Gemini models to try for STT.
+/// When a specific preferred model is selected, it is tried first while
+/// preserving all remaining models in `GOOGLE_MODELS` as automatic fallbacks.
+pub fn google_model_order(preferred: &str) -> Vec<String> {
+    let normalized = normalize_google_model(preferred);
+    let mut order = Vec::with_capacity(GOOGLE_MODELS.len() + 1);
+    if normalized != AUTO_GOOGLE_MODEL {
+        order.push(normalized.clone());
+    }
+    for &model in GOOGLE_MODELS {
+        if model != normalized {
+            order.push(model.to_owned());
+        }
+    }
+    order
+}
+
+/// Formats the active Gemini fallback ladder for display in Settings.
+pub fn format_google_ladder(preferred: &str) -> String {
+    google_model_order(preferred)
+        .into_iter()
+        .enumerate()
+        .map(|(index, model)| format!("{}. {model}", index + 1))
+        .collect::<Vec<_>>()
+        .join(" → ")
+}
+
+fn is_placeholder_transcript(text: &str) -> bool {
+    text.trim() == NO_SPEECH_TEXT
 }
 
 #[derive(Clone, Debug, Default)]
@@ -627,8 +673,11 @@ impl SttEngine {
                     result,
                 } => match result {
                     Ok(transcript) => {
+                        let cacheable = !is_placeholder_transcript(&transcript.text);
                         self.states.insert(key, TranscriptState::Done(transcript));
-                        cache_dirty = true;
+                        if cacheable {
+                            cache_dirty = true;
+                        }
                         self.advance_bulk(generation, true);
                     }
                     Err(error) => {
@@ -699,6 +748,9 @@ impl SttEngine {
             .entries
             .into_iter()
             .filter_map(|(raw_key, entry)| {
+                if is_placeholder_transcript(&entry.text) {
+                    return None;
+                }
                 let age = now.saturating_sub(entry.updated_at_secs);
                 if age > CACHE_MAX_AGE_SECS {
                     return None;
@@ -719,7 +771,9 @@ impl SttEngine {
             .states
             .iter()
             .filter_map(|(key, state)| match state {
-                TranscriptState::Done(entry) => Some((key.clone(), entry.clone())),
+                TranscriptState::Done(entry) if !is_placeholder_transcript(&entry.text) => {
+                    Some((key.clone(), entry.clone()))
+                }
                 _ => None,
             })
             .collect();
@@ -998,6 +1052,16 @@ fn transcribe_google(
     mime: &str,
     config: &SttConfig,
 ) -> Result<CachedTranscript, ApiError> {
+    transcribe_google_with_base_url(GEMINI_BASE_URL, client, bytes, mime, config)
+}
+
+fn transcribe_google_with_base_url(
+    base_url: &str,
+    client: &reqwest::blocking::Client,
+    bytes: &[u8],
+    mime: &str,
+    config: &SttConfig,
+) -> Result<CachedTranscript, ApiError> {
     if bytes.len() > MAX_GOOGLE_INLINE_BYTES {
         return Err(ApiError::fatal(format!(
             "Audio troppo grande per Google inline ({:.1} MB > 14 MB).",
@@ -1006,10 +1070,25 @@ fn transcribe_google(
     }
 
     let encoded_audio = BASE64_STANDARD.encode(bytes);
+    let models = google_model_order(&config.google_model);
+    let clean_base = base_url.trim_end_matches('/');
     let mut last_err = ApiError::fatal("Nessun modello Google Gemini disponibile.");
-    for &model in GOOGLE_MODELS {
-        let payload = build_google_payload(model, mime, &encoded_audio, &config.language)?;
-        let url = format!("{GEMINI_BASE_URL}/{model}:generateContent");
+    let mut last_empty_model: Option<String> = None;
+    let mut all_attempts_empty = true;
+
+    for model in models {
+        let payload = match build_google_payload(&model, mime, &encoded_audio, &config.language) {
+            Ok(payload) => payload,
+            Err(err) => {
+                all_attempts_empty = false;
+                last_err = err;
+                continue;
+            }
+        };
+        if config.debug {
+            log::info!("stt google try model={model}");
+        }
+        let url = format!("{clean_base}/{model}:generateContent");
         for attempt in 0..GEMINI_ATTEMPTS_PER_MODEL {
             let response = client
                 .post(&url)
@@ -1024,17 +1103,52 @@ fn transcribe_google(
                     let retry_after = parse_retry_after(resp.headers());
                     let raw_body = resp.text().unwrap_or_default();
                     if status.is_success() {
-                        let text = extract_gemini_text(&raw_body)?;
-                        if config.debug {
-                            log::info!("stt google ok model={} chars={}", model, text.len());
+                        match extract_gemini_raw_text(&raw_body) {
+                            Ok(Some(text)) => {
+                                if config.debug {
+                                    log::info!(
+                                        "stt google ok model={} chars={}",
+                                        model,
+                                        text.len()
+                                    );
+                                }
+                                return Ok(CachedTranscript {
+                                    text,
+                                    provider: "Google".to_owned(),
+                                    model: model.clone(),
+                                    language: config.language.clone(),
+                                    updated_at_secs: unix_now_secs(),
+                                });
+                            }
+                            Ok(None) => {
+                                // Empty/no-speech from one Gemini model must fall back to the next.
+                                if config.debug {
+                                    log::warn!(
+                                        "stt google empty model={} body_len={}; falling back",
+                                        model,
+                                        raw_body.len()
+                                    );
+                                }
+                                last_empty_model = Some(model.clone());
+                                last_err = ApiError::fatal(format!(
+                                    "Google ({model}) non ha rilevato parlato."
+                                ));
+                                break;
+                            }
+                            Err(err) => {
+                                if config.debug {
+                                    log::warn!(
+                                        "stt google unparseable model={}: {}; falling back",
+                                        model,
+                                        err.message
+                                    );
+                                }
+                                all_attempts_empty = false;
+                                last_err =
+                                    ApiError::fatal(format!("Google ({model}): {}", err.message));
+                                break;
+                            }
                         }
-                        return Ok(CachedTranscript {
-                            text,
-                            provider: "Google".to_owned(),
-                            model: model.to_owned(),
-                            language: config.language.clone(),
-                            updated_at_secs: unix_now_secs(),
-                        });
                     }
 
                     let code = status.as_u16();
@@ -1052,27 +1166,22 @@ fn transcribe_google(
                         });
                     }
 
-                    let model_unavailable = matches!(code, 400 | 404);
                     let retryable = code == 429 || code >= 500;
+                    all_attempts_empty = false;
                     last_err = ApiError {
                         message: format!("Google ({model}) HTTP {code}: {detail}"),
                         auth_failed: false,
                     };
-                    if model_unavailable {
-                        break;
-                    }
                     if retryable && attempt + 1 < GEMINI_ATTEMPTS_PER_MODEL {
                         let delay = retry_after.unwrap_or(2).min(10);
                         thread::sleep(Duration::from_secs(delay));
                         continue;
                     }
-                    // On quota / overload (429/503), fall through to try the next Gemini model.
-                    if retryable {
-                        break;
-                    }
-                    return Err(last_err);
+                    // On 400/404/429/5xx for a single model, fall through to try the next Gemini model.
+                    break;
                 }
                 Err(err) => {
+                    all_attempts_empty = false;
                     last_err = ApiError::retryable(format!("Errore rete Google ({model}): {err}"));
                     if attempt + 1 < GEMINI_ATTEMPTS_PER_MODEL {
                         thread::sleep(Duration::from_secs(1));
@@ -1085,6 +1194,16 @@ fn transcribe_google(
         if last_err.auth_failed {
             return Err(last_err);
         }
+    }
+
+    if all_attempts_empty && let Some(model) = last_empty_model {
+        return Ok(CachedTranscript {
+            text: NO_SPEECH_TEXT.to_owned(),
+            provider: "Google".to_owned(),
+            model,
+            language: config.language.clone(),
+            updated_at_secs: unix_now_secs(),
+        });
     }
 
     Err(last_err)
@@ -1283,38 +1402,96 @@ fn build_google_prompt(language: &str) -> String {
     }
 }
 
-fn extract_gemini_text(raw_body: &str) -> Result<String, ApiError> {
+fn append_text_piece(joined: &mut String, piece: &str) {
+    if piece.is_empty() {
+        return;
+    }
+    if !joined.is_empty() && !piece.starts_with(char::is_whitespace) {
+        joined.push(' ');
+    }
+    joined.push_str(piece);
+}
+
+fn extract_gemini_raw_text(raw_body: &str) -> Result<Option<String>, ApiError> {
     let value: serde_json::Value = serde_json::from_str(raw_body)
         .map_err(|err| ApiError::fatal(format!("Risposta Gemini non valida: {err}")))?;
     let candidates = value
         .get("candidates")
         .and_then(|v| v.as_array())
         .ok_or_else(|| {
-            ApiError::fatal("Risposta Gemini priva di trascrizione (nessun candidato).")
+            if let Some(reason) = value
+                .get("promptFeedback")
+                .and_then(|f| f.get("blockReason"))
+                .and_then(|r| r.as_str())
+            {
+                ApiError::fatal(format!("Richiesta Gemini bloccata ({reason})."))
+            } else {
+                ApiError::fatal("Risposta Gemini priva di trascrizione (nessun candidato).")
+            }
         })?;
+    let Some(first) = candidates.first() else {
+        return Err(ApiError::fatal(
+            "Risposta Gemini priva di trascrizione (candidati vuoti).",
+        ));
+    };
+
     let mut joined = String::new();
-    if let Some(first) = candidates.first()
-        && let Some(parts) = first
-            .get("content")
-            .and_then(|c| c.get("parts"))
-            .and_then(|p| p.as_array())
+    if let Some(parts) = first
+        .get("content")
+        .and_then(|c| c.get("parts"))
+        .and_then(|p| p.as_array())
     {
         for part in parts {
+            // Skip explicit reasoning blocks so thinking traces never leak into transcripts.
+            if part.get("thought").and_then(|v| v.as_bool()) == Some(true) {
+                continue;
+            }
             if let Some(piece) = part.get("text").and_then(|t| t.as_str()) {
-                if !joined.is_empty() && !piece.starts_with(char::is_whitespace) {
-                    joined.push(' ');
+                append_text_piece(&mut joined, piece);
+                continue;
+            }
+            // Dedicated ASR models (gemini-3.5-transcribe) return structured audioTranscription objects.
+            if let Some(transcribe) = part.get("audioTranscription") {
+                if let Some(piece) = transcribe.get("text").and_then(|t| t.as_str()) {
+                    append_text_piece(&mut joined, piece);
+                } else if let Some(segments) = transcribe.get("segments").and_then(|s| s.as_array())
+                {
+                    for segment in segments {
+                        if let Some(seg_text) = segment.get("text").and_then(|t| t.as_str()) {
+                            append_text_piece(&mut joined, seg_text);
+                        }
+                    }
                 }
-                joined.push_str(piece);
             }
         }
     }
-    Ok(normalize_transcript_text(&joined))
+
+    let trimmed = joined.trim();
+    if trimmed.is_empty() {
+        if let Some(reason) = first.get("finishReason").and_then(|r| r.as_str())
+            && !reason.eq_ignore_ascii_case("STOP")
+        {
+            return Err(ApiError::fatal(format!(
+                "Trascrizione Gemini incompleta ({reason})."
+            )));
+        }
+        return Ok(None);
+    }
+    Ok(Some(trimmed.to_owned()))
+}
+
+#[cfg(test)]
+fn extract_gemini_text(raw_body: &str) -> Result<String, ApiError> {
+    Ok(match extract_gemini_raw_text(raw_body)? {
+        Some(text) => text,
+        None => NO_SPEECH_TEXT.to_owned(),
+    })
 }
 
 fn normalize_transcript_text(raw: &str) -> String {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
-        "(Nessun parlato rilevato)".to_owned()
+        NO_SPEECH_TEXT.to_owned()
     } else {
         trimmed.to_owned()
     }
@@ -1984,6 +2161,183 @@ mod tests {
         assert_eq!(
             extract_gemini_text(blank_json).unwrap(),
             "(Nessun parlato rilevato)"
+        );
+        assert_eq!(extract_gemini_raw_text(blank_json).unwrap(), None);
+
+        // Dedicated gemini-3.5-transcribe responses embed transcript under parts[*].audioTranscription.text.
+        let transcribe_json = r#"{"candidates":[{"content":{"parts":[{"audioTranscription":{"text":"Ciao Davide, prova uno due tre."}}]},"finishReason":"STOP"}]}"#;
+        assert_eq!(
+            extract_gemini_text(transcribe_json).unwrap(),
+            "Ciao Davide, prova uno due tre."
+        );
+
+        // Reasoning/thought parts must not be merged into the visible transcript.
+        let thought_json = r#"{"candidates":[{"content":{"parts":[{"thought":true,"text":"internal chain"},{"text":"Testo finale."}]},"finishReason":"STOP"}]}"#;
+        assert_eq!(extract_gemini_text(thought_json).unwrap(), "Testo finale.");
+    }
+
+    fn spawn_mock_gemini_server(
+        responses: Vec<(u16, &'static str)>,
+    ) -> (
+        String,
+        std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+        thread::JoinHandle<()>,
+    ) {
+        use std::io::{BufRead, BufReader, Read, Write};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let seen_paths = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen_clone = seen_paths.clone();
+
+        let handle = thread::spawn(move || {
+            for (status_code, body) in responses {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                let mut request_line = String::new();
+                reader.read_line(&mut request_line).unwrap();
+                let path = request_line
+                    .split_whitespace()
+                    .nth(1)
+                    .unwrap_or("")
+                    .to_owned();
+                seen_clone.lock().unwrap().push(path);
+
+                let mut content_len = 0usize;
+                loop {
+                    let mut line = String::new();
+                    reader.read_line(&mut line).unwrap();
+                    if line == "\r\n" || line.is_empty() {
+                        break;
+                    }
+                    if let Some((name, val)) = line.split_once(':')
+                        && name.trim().eq_ignore_ascii_case("content-length")
+                    {
+                        content_len = val.trim().parse().unwrap_or(0);
+                    }
+                }
+                if content_len > 0 {
+                    let mut discard = vec![0u8; content_len];
+                    reader.read_exact(&mut discard).unwrap();
+                }
+
+                let reason = match status_code {
+                    200 => "OK",
+                    400 => "Bad Request",
+                    404 => "Not Found",
+                    _ => "Error",
+                };
+                let reply = format!(
+                    "HTTP/1.1 {status_code} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                stream.write_all(reply.as_bytes()).unwrap();
+                stream.flush().unwrap();
+            }
+        });
+
+        (format!("http://{addr}"), seen_paths, handle)
+    }
+
+    #[test]
+    fn google_empty_response_falls_back_to_next_model() {
+        let (base_url, seen_paths, handle) = spawn_mock_gemini_server(vec![
+            (
+                200,
+                r#"{"candidates":[{"content":{"parts":[{}]},"finishReason":"STOP"}]}"#,
+            ),
+            (
+                200,
+                r#"{"candidates":[{"content":{"parts":[{"text":"Trascrizione di riserva."}]},"finishReason":"STOP"}]}"#,
+            ),
+        ]);
+        let client = build_http_client(None, 5).unwrap();
+        let config = SttConfig {
+            groq_api_key: String::new(),
+            google_api_key: "test-key".to_owned(),
+            provider: SttProvider::Google,
+            language: "it".to_owned(),
+            model: DEFAULT_GROQ_MODEL.to_owned(),
+            google_model: AUTO_GOOGLE_MODEL.to_owned(),
+            debug: false,
+            proxy: None,
+        };
+
+        let result =
+            transcribe_google_with_base_url(&base_url, &client, b"OggSfake", "audio/ogg", &config)
+                .unwrap();
+        handle.join().unwrap();
+
+        assert_eq!(result.text, "Trascrizione di riserva.");
+        assert_eq!(result.model, "gemini-3.5-flash-lite");
+        let paths = seen_paths.lock().unwrap();
+        assert_eq!(
+            paths.as_slice(),
+            &[
+                "/gemini-3.5-transcribe:generateContent",
+                "/gemini-3.5-flash-lite:generateContent",
+            ]
+        );
+    }
+
+    #[test]
+    fn google_model_order_and_ladder_formatting() {
+        assert_eq!(
+            google_model_order("auto"),
+            vec![
+                "gemini-3.5-transcribe",
+                "gemini-3.5-flash-lite",
+                "gemini-3.1-flash-lite",
+                "gemini-4-hydrogen",
+            ]
+        );
+        assert_eq!(
+            google_model_order("gemini-3.1-flash-lite"),
+            vec![
+                "gemini-3.1-flash-lite",
+                "gemini-3.5-transcribe",
+                "gemini-3.5-flash-lite",
+                "gemini-4-hydrogen",
+            ]
+        );
+        assert!(
+            format_google_ladder("gemini-3.5-flash-lite")
+                .starts_with("1. gemini-3.5-flash-lite → 2. gemini-3.5-transcribe")
+        );
+        assert!(is_placeholder_transcript(NO_SPEECH_TEXT));
+        assert!(!is_placeholder_transcript("Ciao"));
+    }
+
+    #[test]
+    fn google_custom_primary_model_runs_first() {
+        let (base_url, seen_paths, handle) = spawn_mock_gemini_server(vec![(
+            200,
+            r#"{"candidates":[{"content":{"parts":[{"text":"Prima Flash Lite."}]},"finishReason":"STOP"}]}"#,
+        )]);
+        let client = build_http_client(None, 5).unwrap();
+        let config = SttConfig {
+            groq_api_key: String::new(),
+            google_api_key: "test-key".to_owned(),
+            provider: SttProvider::Google,
+            language: "it".to_owned(),
+            model: DEFAULT_GROQ_MODEL.to_owned(),
+            google_model: "gemini-3.5-flash-lite".to_owned(),
+            debug: false,
+            proxy: None,
+        };
+
+        let result =
+            transcribe_google_with_base_url(&base_url, &client, b"OggSfake", "audio/ogg", &config)
+                .unwrap();
+        handle.join().unwrap();
+
+        assert_eq!(result.model, "gemini-3.5-flash-lite");
+        assert_eq!(result.text, "Prima Flash Lite.");
+        assert_eq!(
+            seen_paths.lock().unwrap().as_slice(),
+            &["/gemini-3.5-flash-lite:generateContent"]
         );
     }
 

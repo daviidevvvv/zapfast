@@ -927,6 +927,51 @@ fn sections(app: &App) -> Vec<Section> {
             }
         },
     );
+    let google_ladder = crate::stt::format_google_ladder(&app.settings.stt_google_model);
+    stt_section.row(
+        translated(locale, "Modello Google"),
+        Text {
+            shown: format!(
+                "Modello primario Google Gemini (fallback automatico).\nScaletta attiva: {google_ladder}"
+            )
+            .into(),
+            source: format!(
+                "Modello Google Gemini e scaletta fallback: {google_ladder}"
+            )
+            .into(),
+        },
+        move |ui, app| {
+            let palette = app.palette;
+            let normalized = crate::stt::normalize_google_model(&app.settings.stt_google_model);
+            let is_auto = normalized == crate::stt::AUTO_GOOGLE_MODEL;
+            let selected_label = if is_auto {
+                "Auto (scaletta)"
+            } else {
+                normalized.as_str()
+            };
+            let response = egui::ComboBox::from_id_salt("stt_google_model")
+                .selected_text(selected_label)
+                .width(220.0_f32.min(ui.available_width()))
+                .show_ui(ui, |ui| {
+                    if theme_option(
+                        ui,
+                        &palette,
+                        "Auto (scaletta predefinita)",
+                        is_auto,
+                    ) {
+                        app.settings.stt_google_model = crate::stt::AUTO_GOOGLE_MODEL.to_owned();
+                        app.actions.push(Action::SettingsChanged);
+                    }
+                    for &candidate in crate::stt::GOOGLE_MODELS {
+                        if theme_option(ui, &palette, candidate, normalized == candidate) {
+                            app.settings.stt_google_model = candidate.to_owned();
+                            app.actions.push(Action::SettingsChanged);
+                        }
+                    }
+                });
+            theme::reveal_focus(&response.response);
+        },
+    );
     stt_section.toggle(
         translated(locale, "Log dettagliati"),
         translated(
