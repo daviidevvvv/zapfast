@@ -738,18 +738,21 @@ impl eframe::App for Shell {
         }
     }
 
-    #[cfg(feature = "demo")]
     fn raw_input_hook(&mut self, ctx: &egui::Context, input: &mut egui::RawInput) {
-        if let Some(tour) = &mut self.tour {
-            tour.input(&mut self.app, ctx, input);
-        }
-        // Moves the pointer only while it is elsewhere: each move restarts
-        // egui's tooltip delay, so a fake pointer that kept moving in place
-        // would never show one.
-        if let Some(pos) = self.hover
-            && ctx.input(|input| input.pointer.latest_pos()) != Some(pos)
+        self.app.prepare_scroll_input(ctx, input);
+        #[cfg(feature = "demo")]
         {
-            input.events.push(egui::Event::PointerMoved(pos));
+            if let Some(tour) = &mut self.tour {
+                tour.input(&mut self.app, ctx, input);
+            }
+            // Moves the pointer only while it is elsewhere: each move restarts
+            // egui's tooltip delay, so a fake pointer that kept moving in place
+            // would never show one.
+            if let Some(pos) = self.hover
+                && ctx.input(|input| input.pointer.latest_pos()) != Some(pos)
+            {
+                input.events.push(egui::Event::PointerMoved(pos));
+            }
         }
     }
 

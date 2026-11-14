@@ -447,6 +447,88 @@ fn composer_link(text: &str) -> Option<String> {
     crate::safety::first_link(text).filter(|url| crate::safety::preview_url(url).is_some())
 }
 
+const WINDOWS_LINE_SCROLL_SPEED: f32 = 42.0;
+const DEFAULT_LINE_SCROLL_SPEED: f32 = 120.0;
+const WINDOWS_TOUCHPAD_FACTOR: f32 = 0.52;
+const TOUCHPAD_LATCH_SECS: f64 = 0.45;
+
+/// Tracks input-level scroll scaling across frames (for example, Windows
+/// Precision Touchpad gestures arriving as fractional line deltas).
+#[derive(Debug, Default)]
+pub(crate) struct ScrollInputState {
+    last_fractional_wheel_at: Option<f64>,
+}
+
+impl ScrollInputState {
+    fn target_line_scroll_speed(scroll_speed: f32, is_windows: bool) -> f32 {
+        let base = if is_windows {
+            WINDOWS_LINE_SCROLL_SPEED
+        } else {
+            DEFAULT_LINE_SCROLL_SPEED
+        };
+        base * scroll_speed
+    }
+
+    fn apply_line_scroll_speed(ctx: &egui::Context, scroll_speed: f32, is_windows: bool) {
+        let target = Self::target_line_scroll_speed(scroll_speed, is_windows);
+        let current = ctx.options(|options| options.input_options.line_scroll_speed);
+        if (current - target).abs() > 1e-3 {
+            ctx.options_mut(|options| options.input_options.line_scroll_speed = target);
+        }
+    }
+
+    fn prepare_raw_input_for(
+        &mut self,
+        ctx: &egui::Context,
+        input: &mut egui::RawInput,
+        scroll_speed: f32,
+        is_windows: bool,
+    ) {
+        Self::apply_line_scroll_speed(ctx, scroll_speed, is_windows);
+
+        let now = input.time.unwrap_or_else(|| ctx.input(|i| i.time));
+        let zoom_modifier = ctx.options(|options| options.input_options.zoom_modifier);
+
+        for event in &mut input.events {
+            let egui::Event::MouseWheel {
+                unit,
+                delta,
+                modifiers,
+                ..
+            } = event
+            else {
+                continue;
+            };
+            if modifiers.matches_any(zoom_modifier) {
+                continue;
+            }
+            match unit {
+                egui::MouseWheelUnit::Line => {
+                    if is_windows {
+                        let is_fractional =
+                            delta.x.fract().abs() > 1e-4 || delta.y.fract().abs() > 1e-4;
+                        if is_fractional {
+                            self.last_fractional_wheel_at = Some(now);
+                        }
+                        let is_touchpad = is_fractional
+                            || self.last_fractional_wheel_at.is_some_and(|prev| {
+                                let elapsed = now - prev;
+                                (0.0..=TOUCHPAD_LATCH_SECS).contains(&elapsed)
+                            });
+                        if is_touchpad {
+                            *delta *= WINDOWS_TOUCHPAD_FACTOR;
+                        }
+                    }
+                }
+                egui::MouseWheelUnit::Point => {
+                    *delta *= scroll_speed;
+                }
+                egui::MouseWheelUnit::Page => {}
+            }
+        }
+    }
+}
+
 pub struct App {
     pub dirs: AppDirs,
     pub settings: Settings,
@@ -748,6 +830,9 @@ pub struct App {
     /// The wheel step, and on Linux the touchpad's scale, glide and axis
     /// lock.
     pub(crate) scrolling: fastframe_scroll::Scrolling,
+    /// Calibrates mouse-wheel and Precision Touchpad scroll events before egui
+    /// integrates them.
+    pub(crate) scroll_input: ScrollInputState,
     /// Keeps a scroll gesture with the pane it began over.
     pub scroll_route: ScrollRoute,
 
@@ -1709,6 +1794,7 @@ impl App {
             picture_origins: Default::default(),
             picture_texture: None,
             scrolling: fastframe_scroll::Scrolling::default(),
+            scroll_input: ScrollInputState::default(),
             scroll_route: ScrollRoute::default(),
             page: Page::Chats,
             dialog: None,
@@ -11633,6 +11719,7 @@ impl App {
             self.dropping = false;
         } else {
             self.scrolling.apply(ctx);
+            self.enforce_scroll_speed(ctx);
             self.route_scroll(ctx);
             Self::paste_shift_insert(ctx);
             self.take_drops_and_pastes(ctx);
@@ -11657,6 +11744,28 @@ impl App {
         {
             ctx.request_repaint_after(Duration::from_millis(120));
         }
+    }
+
+    /// Normalizes mouse-wheel and touchpad scroll input before egui integrates
+    /// it into [`egui::InputState::smooth_scroll_delta`].
+    pub fn prepare_scroll_input(&mut self, ctx: &egui::Context, input: &mut egui::RawInput) {
+        self.scroll_input.prepare_raw_input_for(
+            ctx,
+            input,
+            self.settings.effective_scroll_speed(),
+            cfg!(target_os = "windows"),
+        );
+    }
+
+    /// Re-applies ZapFast's calibrated `line_scroll_speed` so `fastframe-scroll`
+    /// cannot overwrite a Windows or user-configured value close to egui's
+    /// `40.0` default back to `120.0`.
+    fn enforce_scroll_speed(&self, ctx: &egui::Context) {
+        ScrollInputState::apply_line_scroll_speed(
+            ctx,
+            self.settings.effective_scroll_speed(),
+            cfg!(target_os = "windows"),
+        );
     }
 
     fn request_gif_page(&mut self, offset: usize) {
@@ -15542,6 +15651,124 @@ mod tests {
         assert!(!app.scrolling.gliding(), "the glide stops");
         run(&mut app, time + 1.0, egui::Vec2::ZERO);
         assert_eq!(app.scroll_route.owner, None, "the next gesture picks");
+    }
+
+    #[test]
+    fn windows_fractional_wheel_calibrates_touchpad_without_touching_zoom() {
+        let ctx = egui::Context::default();
+        let mut state = ScrollInputState::default();
+
+        // Discrete integer mouse-wheel click does not trigger the touchpad
+        // factor, and uses the calmer Windows line_scroll_speed (42.0).
+        let mut mouse_input = egui::RawInput {
+            time: Some(1.0),
+            events: vec![egui::Event::MouseWheel {
+                unit: egui::MouseWheelUnit::Line,
+                delta: egui::vec2(0.0, -1.0),
+                modifiers: egui::Modifiers::NONE,
+                phase: egui::TouchPhase::Move,
+            }],
+            ..Default::default()
+        };
+        state.prepare_raw_input_for(&ctx, &mut mouse_input, 1.0, true);
+        assert_eq!(
+            ctx.options(|o| o.input_options.line_scroll_speed),
+            WINDOWS_LINE_SCROLL_SPEED
+        );
+        match mouse_input.events[0] {
+            egui::Event::MouseWheel { delta, .. } => assert_eq!(delta, egui::vec2(0.0, -1.0)),
+            _ => unreachable!(),
+        }
+
+        // Precision Touchpad emits fractional line deltas: scales by 0.52 and
+        // latches so an exact integer follow-up event inside 0.45s also scales.
+        let mut pad_input = egui::RawInput {
+            time: Some(1.1),
+            events: vec![
+                egui::Event::MouseWheel {
+                    unit: egui::MouseWheelUnit::Line,
+                    delta: egui::vec2(0.0, -0.25),
+                    modifiers: egui::Modifiers::NONE,
+                    phase: egui::TouchPhase::Move,
+                },
+                egui::Event::MouseWheel {
+                    unit: egui::MouseWheelUnit::Line,
+                    delta: egui::vec2(0.0, -1.0),
+                    modifiers: egui::Modifiers::NONE,
+                    phase: egui::TouchPhase::Move,
+                },
+            ],
+            ..Default::default()
+        };
+        state.prepare_raw_input_for(&ctx, &mut pad_input, 1.0, true);
+        match pad_input.events[0] {
+            egui::Event::MouseWheel { delta, .. } => {
+                assert!((delta.y + 0.25 * WINDOWS_TOUCHPAD_FACTOR).abs() < 1e-6);
+            }
+            _ => unreachable!(),
+        }
+        match pad_input.events[1] {
+            egui::Event::MouseWheel { delta, .. } => {
+                assert!((delta.y + WINDOWS_TOUCHPAD_FACTOR).abs() < 1e-6);
+            }
+            _ => unreachable!(),
+        }
+
+        // Ctrl+Wheel / touchpad pinch-to-zoom must remain untouched.
+        let mut zoom_input = egui::RawInput {
+            time: Some(1.15),
+            events: vec![egui::Event::MouseWheel {
+                unit: egui::MouseWheelUnit::Line,
+                delta: egui::vec2(0.0, 0.2),
+                modifiers: egui::Modifiers::CTRL,
+                phase: egui::TouchPhase::Move,
+            }],
+            ..Default::default()
+        };
+        state.prepare_raw_input_for(&ctx, &mut zoom_input, 0.5, true);
+        match zoom_input.events[0] {
+            egui::Event::MouseWheel { delta, .. } => assert_eq!(delta, egui::vec2(0.0, 0.2)),
+            _ => unreachable!(),
+        }
+
+        // Once the latch expires, pure integer notches go back to unscaled 1.0.
+        let mut later_mouse = egui::RawInput {
+            time: Some(2.0),
+            events: vec![egui::Event::MouseWheel {
+                unit: egui::MouseWheelUnit::Line,
+                delta: egui::vec2(0.0, 1.0),
+                modifiers: egui::Modifiers::NONE,
+                phase: egui::TouchPhase::Move,
+            }],
+            ..Default::default()
+        };
+        state.prepare_raw_input_for(&ctx, &mut later_mouse, 1.0, true);
+        match later_mouse.events[0] {
+            egui::Event::MouseWheel { delta, .. } => assert_eq!(delta, egui::vec2(0.0, 1.0)),
+            _ => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn fastframe_scroll_does_not_reset_calibrated_line_scroll_speed() {
+        let mut app = app();
+        let ctx = egui::Context::default();
+        app.settings.scroll_speed = 40.0 / WINDOWS_LINE_SCROLL_SPEED;
+        ScrollInputState::apply_line_scroll_speed(
+            &ctx,
+            app.settings.effective_scroll_speed(),
+            true,
+        );
+        app.scrolling.apply(&ctx);
+        ScrollInputState::apply_line_scroll_speed(
+            &ctx,
+            app.settings.effective_scroll_speed(),
+            true,
+        );
+        assert!(
+            (ctx.options(|o| o.input_options.line_scroll_speed) - 40.0).abs() < 1e-3,
+            "calibrated speed must stay near 40.0 instead of reverting to 120.0"
+        );
     }
 
     /// The chat a link asked for can refuse to open: a locked chat outside

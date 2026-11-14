@@ -441,6 +441,8 @@ pub struct Settings {
     pub system_theme_cache: Option<crate::theme::CustomTheme>,
     /// egui zoom factor.
     pub zoom: f32,
+    /// Scroll speed multiplier (`1.0` uses ZapFast's platform default).
+    pub scroll_speed: f32,
     pub sidebar_width: f32,
     /// Width of the search pane beside the open chat.
     pub search_pane_width: f32,
@@ -577,6 +579,7 @@ impl Default for Settings {
             custom_theme_cache: None,
             system_theme_cache: None,
             zoom: 1.0,
+            scroll_speed: SCROLL_SPEED_DEFAULT,
             sidebar_width: 300.0,
             search_pane_width: 380.0,
             info_pane_width: 380.0,
@@ -636,6 +639,13 @@ impl Default for Settings {
 /// 1. The wallpaper colours that were the defaults (Beige, and Black in dark
 ///    mode) become [`WallpaperColor::Theme`], the new default.
 pub const SETTINGS_VERSION: u32 = 1;
+
+/// Minimum configurable scroll speed multiplier (`20%`).
+pub const SCROLL_SPEED_MIN: f32 = 0.2;
+/// Maximum configurable scroll speed multiplier (`200%`).
+pub const SCROLL_SPEED_MAX: f32 = 2.0;
+/// Default scroll speed multiplier (`100%`).
+pub const SCROLL_SPEED_DEFAULT: f32 = 1.0;
 
 /// Optional build-time GIPHY key from `ZAPFAST_GIPHY_KEY`.
 /// The previous name remains accepted for existing build setups.
@@ -699,6 +709,23 @@ impl Settings {
         (self.window_width, self.window_height) = geometry.size.map(|[w, h]| (w, h)).unzip();
         (self.window_x, self.window_y) = geometry.position.map(|[x, y]| (x, y)).unzip();
         self.window_maximized = geometry.maximized;
+    }
+
+    /// Validated scroll speed multiplier (`SCROLL_SPEED_DEFAULT` if unset or
+    /// invalid, otherwise clamped to `SCROLL_SPEED_MIN..=SCROLL_SPEED_MAX`).
+    pub fn effective_scroll_speed(&self) -> f32 {
+        if self.scroll_speed.is_finite() && self.scroll_speed > 0.0 {
+            self.scroll_speed.clamp(SCROLL_SPEED_MIN, SCROLL_SPEED_MAX)
+        } else {
+            SCROLL_SPEED_DEFAULT
+        }
+    }
+
+    /// Steps the scroll speed multiplier by `tenths` (`-1` or `+1`) cleanly in
+    /// 10% increments within [`SCROLL_SPEED_MIN`]..=[`SCROLL_SPEED_MAX`].
+    pub fn step_scroll_speed(&mut self, tenths: i8) {
+        let next = ((self.effective_scroll_speed() * 10.0).round() + f32::from(tenths)) / 10.0;
+        self.scroll_speed = next.clamp(SCROLL_SPEED_MIN, SCROLL_SPEED_MAX);
     }
 
     pub fn load(path: &Path) -> Self {
@@ -1519,6 +1546,31 @@ mod giphy_tests {
         let again: AccountSettings =
             serde_json::from_str(&serde_json::to_string(&saved).unwrap()).unwrap();
         assert_eq!(again, saved);
+    }
+
+    #[test]
+    fn scroll_speed_defaults_for_legacy_json_and_clamps() {
+        let older: Settings = serde_json::from_str(r#"{"zoom":1.25}"#).unwrap();
+        assert_eq!(older.scroll_speed, SCROLL_SPEED_DEFAULT);
+        assert_eq!(older.effective_scroll_speed(), 1.0);
+
+        let mut custom = Settings {
+            scroll_speed: 0.0,
+            ..Settings::default()
+        };
+        assert_eq!(custom.effective_scroll_speed(), SCROLL_SPEED_DEFAULT);
+        custom.scroll_speed = f32::NAN;
+        assert_eq!(custom.effective_scroll_speed(), SCROLL_SPEED_DEFAULT);
+        custom.scroll_speed = 0.05;
+        assert_eq!(custom.effective_scroll_speed(), SCROLL_SPEED_MIN);
+        custom.scroll_speed = 9.0;
+        assert_eq!(custom.effective_scroll_speed(), SCROLL_SPEED_MAX);
+
+        custom.scroll_speed = 1.0;
+        custom.step_scroll_speed(-1);
+        assert!((custom.scroll_speed - 0.9).abs() < 1e-6);
+        custom.step_scroll_speed(1);
+        assert!((custom.scroll_speed - 1.0).abs() < 1e-6);
     }
 
     #[test]

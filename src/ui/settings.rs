@@ -412,6 +412,75 @@ fn sections(app: &App) -> Vec<Section> {
             }
         },
     );
+    appearance.row(
+        Text {
+            shown: if locale == Locale::Italian {
+                "Velocità scorrimento".into()
+            } else {
+                "Scroll speed".into()
+            },
+            source: "Scroll speed".into(),
+        },
+        Text {
+            shown: if locale == Locale::Italian {
+                "Regola la sensibilità di rotella e touchpad (su Windows il touchpad è già calibrato al 100%).".into()
+            } else {
+                "Adjusts wheel and touchpad scroll speed (Windows touchpads are pre-calibrated at 100%).".into()
+            },
+            source: "Adjusts wheel and touchpad scroll speed (Windows touchpads are pre-calibrated at 100%).".into(),
+        },
+        move |ui, app| {
+            let speed = app.settings.effective_scroll_speed();
+            let can_increase = speed + 1e-4 < crate::settings::SCROLL_SPEED_MAX;
+            let can_decrease = speed - 1e-4 > crate::settings::SCROLL_SPEED_MIN;
+            let faster_label = if app.locale == Locale::Italian {
+                "Più veloce"
+            } else {
+                "Faster"
+            };
+            let slower_label = if app.locale == Locale::Italian {
+                "Più lento"
+            } else {
+                "Slower"
+            };
+            ui.add_enabled_ui(can_increase, |ui| {
+                if theme::icon_button(
+                    ui,
+                    Icon::Plus,
+                    16.0,
+                    palette.secondary,
+                    palette.text,
+                    faster_label,
+                )
+                .clicked()
+                {
+                    app.settings.step_scroll_speed(1);
+                    app.actions.push(Action::SettingsChanged);
+                }
+            });
+            theme::text(
+                ui,
+                format!("{:.0}%", speed * 100.0),
+                theme::medium(13.5),
+                palette.text,
+            );
+            ui.add_enabled_ui(can_decrease, |ui| {
+                if theme::icon_button(
+                    ui,
+                    Icon::Minus,
+                    16.0,
+                    palette.secondary,
+                    palette.text,
+                    slower_label,
+                )
+                .clicked()
+                {
+                    app.settings.step_scroll_speed(-1);
+                    app.actions.push(Action::SettingsChanged);
+                }
+            });
+        },
+    );
     appearance.row(translated(locale, "Language"), "", language_picker);
     // macOS keeps its own traffic lights over ZapFast's headers.
     if cfg!(any(windows, target_os = "linux")) {
