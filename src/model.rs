@@ -3294,6 +3294,10 @@ pub enum Action {
     CloseUpdate,
     DownloadUpdate,
     InstallUpdate,
+    /// Fetch upstream release, merge into the local fork keeping STT, build, and restart.
+    StartForkUpdate,
+    /// Force an immediate check for upstream ZapFast releases bypassing the 24h interval.
+    CheckForkUpdatesNow,
     SetTheme(crate::settings::ThemeChoice),
     /// Draws the interface in the platform's font or in the bundled Inter.
     SetFont(crate::settings::FontChoice),

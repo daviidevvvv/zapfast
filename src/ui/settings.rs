@@ -717,6 +717,44 @@ fn sections(app: &App) -> Vec<Section> {
         ),
         |settings| &mut settings.check_for_updates,
     );
+    let check_now_desc = if locale == Locale::Italian {
+        "Controlla subito nuove release su crmne/zapfast (con merge automatico e STT)."
+    } else {
+        "Check crmne/zapfast now for a new release (auto-merge keeping STT)."
+    };
+    system.row(
+        Text {
+            shown: if locale == Locale::Italian {
+                "Controllo fork & merge automatico".into()
+            } else {
+                "Fork update check".into()
+            },
+            source: "Fork update check now crmne/zapfast".into(),
+        },
+        Text {
+            shown: check_now_desc.into(),
+            source: "Check crmne/zapfast now for a new release (auto-merge keeping STT).".into(),
+        },
+        move |ui, app| {
+            let busy = app.fork_update.is_checking() || app.fork_update.is_running();
+            let label = if app.fork_update.is_checking() {
+                if app.locale == Locale::Italian {
+                    "Controllo..."
+                } else {
+                    "Checking..."
+                }
+            } else if app.locale == Locale::Italian {
+                "Controlla ora"
+            } else {
+                "Check now"
+            };
+            ui.add_enabled_ui(!busy, |ui| {
+                if theme::soft_button(ui, &palette, Some(Icon::Refresh), label, false).clicked() {
+                    app.actions.push(Action::CheckForkUpdatesNow);
+                }
+            });
+        },
+    );
     system.toggle(
         translated(locale, "Download updates automatically"),
         translated(

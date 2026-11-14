@@ -9,7 +9,8 @@ mod chat_export;
 pub mod chats;
 pub mod conversation;
 pub mod dialogs;
-pub(crate) mod focus;
+pub mod focus;
+pub mod fork_update;
 mod glass;
 pub mod image_editor;
 pub mod image_preview;
@@ -92,7 +93,11 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
         accounts::corner(app, ctx);
         dialogs::show(app, ctx);
         overlay::finish(ctx);
-        update::show(app, ctx);
+        if fork_update::handles_modal(app) {
+            fork_update::show(app, ctx);
+        } else {
+            update::show(app, ctx);
+        }
         toasts(app, ctx);
         focus_ring(app, ctx);
         announce(app, ctx);
@@ -115,7 +120,11 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
     }
     slide_shield(ctx, narrow, slide.is_some());
     focus::finish(ctx, main_navigation);
-    update::show(app, ctx);
+    if fork_update::handles_modal(app) {
+        fork_update::show(app, ctx);
+    } else {
+        update::show(app, ctx);
+    }
     picker::show(app, ctx);
     dialogs::show(app, ctx);
     image_preview::show(app, ctx);
@@ -575,16 +584,12 @@ fn banner(app: &mut App, ui: &mut egui::Ui) {
             false,
             None,
         ),
-        LinkStatus::Connected if update.is_some() => {
-            let update = update.as_ref().expect("checked above");
-            (
-                Icon::Info,
-                crate::i18n::gettext(app.locale, "ZapFast {version} is available")
-                    .replace("{version}", &update.version),
-                palette.accent,
-                false,
-                Some(update.url.clone()),
-            )
+        LinkStatus::Connected if update.is_some() || app.fork_update.is_active() => {
+            if let Some(spec) = fork_update::banner_spec(app, update.as_ref()) {
+                (spec.icon, spec.text, spec.tint, spec.danger, Some(spec.url))
+            } else {
+                return;
+            }
         }
         LinkStatus::Connected => return,
         LinkStatus::Starting | LinkStatus::Connecting => (
@@ -641,17 +646,7 @@ fn banner(app: &mut App, ui: &mut egui::Ui) {
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         ui.add_space(room.right);
                         if download.is_some() {
-                            if theme::soft_button(
-                                ui,
-                                &palette,
-                                Some(Icon::ExternalLink),
-                                &crate::i18n::gettext(app.locale, "Update"),
-                                false,
-                            )
-                            .clicked()
-                            {
-                                app.actions.push(Action::ShowUpdate);
-                            }
+                            fork_update::draw_banner_actions(app, ui);
                         } else if theme::soft_button(
                             ui,
                             &palette,

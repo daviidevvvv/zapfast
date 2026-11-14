@@ -691,6 +691,8 @@ pub struct App {
     pub viewer_media_state: HashMap<String, MediaState>,
     /// Speech-to-text engine and persistent cache for voice messages.
     pub stt: crate::stt::SttEngine,
+    /// Upstream 24-hour release checker and local fork auto-merge updater.
+    pub fork_update: crate::fork_update::ForkUpdater,
     /// Message bodies registered for transcript copy formatting.
     pub copy_rows: std::sync::Arc<std::sync::Mutex<Vec<crate::transcript::Row>>>,
     /// Previous message-list rect used by the selection hook.
@@ -1560,6 +1562,9 @@ impl App {
         let tray_lockable = settings.app_lock_hash.is_some();
         let stt_cache = dirs.state.join("stt_cache.json");
         let stt = crate::stt::SttEngine::new(stt_cache, waker.clone());
+        let mut fork_update = crate::fork_update::ForkUpdater::new(&dirs, waker.clone());
+        let initial_update = fork_update.cached_release();
+        let just_updated_to = fork_update.take_just_updated_notice();
         let mut app = Self {
             dirs,
             settings,
@@ -1679,6 +1684,7 @@ impl App {
             viewer_media_chat: None,
             viewer_media_state: HashMap::new(),
             stt,
+            fork_update,
             copy_rows: Default::default(),
             selection_view: Default::default(),
             gif_query: String::new(),
@@ -1728,7 +1734,7 @@ impl App {
             prefilled: None,
             deferred_account_actions: Vec::new(),
             events_hidden: false,
-            update: None,
+            update: initial_update,
             last_update_check: None,
             show_update: false,
             update_download: Default::default(),
@@ -1815,6 +1821,14 @@ impl App {
         app.settings.voice_speed = app.player.set_speed(app.settings.voice_speed);
         // The chip comes back with its account; a label is the window's.
         app.label_filter = app.remembered_label();
+        if let Some(version) = just_updated_to {
+            let notice = if app.locale == crate::i18n::Locale::Italian {
+                format!("ZapFast aggiornato a v{version} (trascrizione STT attiva) ✨")
+            } else {
+                format!("ZapFast updated to v{version} (STT preserved) ✨")
+            };
+            app.toast(notice);
+        }
         app
     }
 
@@ -3693,6 +3707,40 @@ impl App {
             self.finish_removed(index);
         }
         self.stt.poll();
+        let fork_poll = self.fork_update.poll();
+        if let Some(release) = fork_poll.found_update {
+            if self.update.as_ref() != Some(&release) {
+                let notice = if self.locale == crate::i18n::Locale::Italian {
+                    format!(
+                        "Nuovo aggiornamento ZapFast {} disponibile ✨",
+                        release.version
+                    )
+                } else {
+                    format!("ZapFast {} is available ✨", release.version)
+                };
+                self.toast(notice);
+            }
+            self.update = Some(release);
+        } else if fork_poll.clear_update {
+            self.update = None;
+        }
+        if fork_poll.manual_up_to_date {
+            let notice = if self.locale == crate::i18n::Locale::Italian {
+                format!(
+                    "ZapFast {} è già all'ultima versione ✨",
+                    env!("CARGO_PKG_VERSION")
+                )
+            } else {
+                format!("ZapFast {} is up to date ✨", env!("CARGO_PKG_VERSION"))
+            };
+            self.toast(notice);
+        }
+        if let Some(err) = fork_poll.check_error {
+            self.toast_error(err);
+        }
+        if fork_poll.should_quit {
+            self.actions.push(Action::Quit);
+        }
     }
 
     fn apply_backend_event(&mut self, event: Event, live: bool) {
@@ -7001,10 +7049,14 @@ impl App {
             && !self.backend.is_offline()
             && self
                 .last_update_check
-                .is_none_or(|at| at.elapsed() >= crate::updates::CHECK_INTERVAL)
+                .is_none_or(|at| at.elapsed() >= Duration::from_secs(60))
         {
             self.last_update_check = Some(now);
-            self.backend.send(Command::CheckForUpdates);
+            self.fork_update.maybe_start_auto_check(
+                self.settings.check_for_updates,
+                self.backend.is_offline(),
+                u64::try_from(crate::util::now()).unwrap_or(0),
+            );
         }
         self.maybe_download_update();
         if self.settings_dirty && self.last_settings_save.elapsed() > Duration::from_secs(2) {
@@ -9595,8 +9647,10 @@ impl App {
                 self.request_chat_search();
             }
             Action::ShowUpdate => {
-                self.show_update = self.update.is_some();
-                self.inspect_update();
+                self.show_update = self.update.is_some() || self.fork_update.is_active();
+                if !crate::ui::fork_update::handles_modal(self) {
+                    self.inspect_update();
+                }
             }
             Action::CloseUpdate => self.show_update = false,
             Action::DownloadUpdate => self.download_update(),
@@ -9629,6 +9683,21 @@ impl App {
                 self.mark_settings_dirty();
                 crate::theme::set_font(ctx, choice);
                 ctx.request_repaint();
+            }
+            Action::StartForkUpdate => {
+                if self.fork_update.is_running() {
+                    self.show_update = true;
+                } else if let Some(release) = self.update.clone() {
+                    if self.fork_update.has_repo() {
+                        let proxy = crate::proxy::for_whatsapp().map(|p| p.url().to_owned());
+                        self.fork_update.start_merge_and_update(release, proxy);
+                    } else {
+                        self.show_update = true;
+                    }
+                }
+            }
+            Action::CheckForkUpdatesNow => {
+                self.fork_update.start_manual_check();
             }
             Action::SetCustomTitlebar(custom) => {
                 if self.settings.custom_titlebar != custom {

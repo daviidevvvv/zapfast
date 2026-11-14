@@ -24,6 +24,7 @@ pub mod camera;
 pub mod demo;
 pub mod diagnostics;
 pub mod emoji;
+pub mod fork_update;
 pub mod geo;
 pub mod group_admin;
 pub mod i18n;
