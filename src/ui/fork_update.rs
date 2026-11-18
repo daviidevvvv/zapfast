@@ -382,6 +382,7 @@ mod tests {
         let release = Release {
             version: "99.0.0".to_owned(),
             url: "https://github.com/crmne/zapfast/releases/tag/v99.0.0".to_owned(),
+            published_at: None,
         };
         app.update = Some(release.clone());
         let spec = banner_spec(&app, Some(&release)).expect("banner spec for release");

@@ -38,6 +38,8 @@ struct PersistedState {
     #[serde(default)]
     available_url: Option<String>,
     #[serde(default)]
+    available_published_at: Option<String>,
+    #[serde(default)]
     just_updated_to: Option<String>,
 }
 
@@ -131,6 +133,7 @@ impl ForkUpdater {
         {
             state.available_version = None;
             state.available_url = None;
+            state.available_published_at = None;
             let _ = save_state(&state_file, &state);
         }
         let pending_notice = state.just_updated_to.take();
@@ -162,6 +165,7 @@ impl ForkUpdater {
         fastframe_update::is_newer(version, env!("CARGO_PKG_VERSION")).then(|| Release {
             version: version.clone(),
             url: url.clone(),
+            published_at: self.state.available_published_at.clone(),
         })
     }
 
@@ -305,6 +309,7 @@ impl ForkUpdater {
                             self.state.last_checked_unix = checked_at_unix;
                             self.state.available_version = Some(release.version.clone());
                             self.state.available_url = Some(release.url.clone());
+                            self.state.available_published_at = release.published_at.clone();
                             let _ = save_state(&self.state_file, &self.state);
                             outcome.found_update = Some(release);
                         }
@@ -313,6 +318,7 @@ impl ForkUpdater {
                             self.state.last_checked_unix = checked_at_unix;
                             self.state.available_version = None;
                             self.state.available_url = None;
+                            self.state.available_published_at = None;
                             let _ = save_state(&self.state_file, &self.state);
                             outcome.clear_update = true;
                             if manual {
@@ -1001,6 +1007,7 @@ fn run_merge_and_update(
 
     state.available_version = None;
     state.available_url = None;
+    state.available_published_at = None;
     state.just_updated_to = Some(version.to_owned());
     Ok(state)
 }
@@ -1028,6 +1035,7 @@ mod tests {
             last_checked_unix: 1_700_000_123,
             available_version: Some(env!("CARGO_PKG_VERSION").to_owned()),
             available_url: Some("https://github.com/crmne/zapfast/releases/latest".to_owned()),
+            available_published_at: None,
             just_updated_to: Some(env!("CARGO_PKG_VERSION").to_owned()),
         };
         save_state(&state_file, &saved).unwrap();
@@ -1051,6 +1059,7 @@ mod tests {
             last_checked_unix: 1_700_000_500,
             available_version: Some("99.0.0".to_owned()),
             available_url: Some("https://github.com/crmne/zapfast/releases/tag/v99.0.0".to_owned()),
+            available_published_at: Some("2026-11-18T00:00:00Z".to_owned()),
             just_updated_to: None,
         };
         save_state(&state_file, &saved).unwrap();
@@ -1061,6 +1070,7 @@ mod tests {
             Some(Release {
                 version: "99.0.0".to_owned(),
                 url: "https://github.com/crmne/zapfast/releases/tag/v99.0.0".to_owned(),
+                published_at: Some("2026-11-18T00:00:00Z".to_owned()),
             })
         );
     }
